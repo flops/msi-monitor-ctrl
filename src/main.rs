@@ -17,6 +17,8 @@ use std::{
 
 use clap::Parser;
 use device_query::DeviceQuery;
+#[cfg(not(target_os = "windows"))]
+use device_query::Keycode;
 use directories::ProjectDirs;
 use display_info::DisplayInfo;
 use errors::StdError;
@@ -33,6 +35,8 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 
 mod device;
 mod errors;
+#[cfg(target_os = "windows")]
+mod mouse_hook;
 
 static INTERVAL_COUNTER: AtomicUsize = AtomicUsize::new(1);
 
@@ -73,6 +77,87 @@ fn find_screen_edge(displays: &[DisplayInfo], x: i32, y: i32) -> Option<&'static
     _ => None,
   }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum MouseButton {
+  Left,
+  Right,
+  Middle,
+  Back,
+  Forward,
+}
+
+impl MouseButton {
+  #[cfg(not(target_os = "windows"))]
+  fn index(self) -> usize {
+    match self {
+      MouseButton::Left => 1,
+      MouseButton::Right => 2,
+      MouseButton::Middle => 3,
+      MouseButton::Back => 4,
+      MouseButton::Forward => 5,
+    }
+  }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct MouseHotkey {
+  pub(crate) ctrl: bool,
+  pub(crate) shift: bool,
+  pub(crate) alt: bool,
+  pub(crate) meta: bool,
+  pub(crate) button: MouseButton,
+}
+
+fn parse_mouse_hotkey(s: &str) -> Result<MouseHotkey, String> {
+  let mut ctrl = false;
+  let mut shift = false;
+  let mut alt = false;
+  let mut meta = false;
+  let mut button: Option<MouseButton> = None;
+
+  for raw in s.split('+') {
+    let token = raw.trim();
+    if token.is_empty() {
+      continue;
+    }
+    match token.to_ascii_lowercase().as_str() {
+      "ctrl" | "control" | "controlleft" | "controlright" => ctrl = true,
+      "shift" | "shiftleft" | "shiftright" => shift = true,
+      "alt" | "option" | "altleft" | "altright" => alt = true,
+      "meta" | "super" | "win" | "windows" | "cmd" | "command" | "metaleft" | "metaright" => {
+        meta = true;
+      },
+      "mouseleft" | "leftbutton" => button = Some(MouseButton::Left),
+      "mouseright" | "rightbutton" => button = Some(MouseButton::Right),
+      "mousemiddle" | "middlebutton" => button = Some(MouseButton::Middle),
+      "mouseback" | "mousex1" | "xbutton1" | "browserback" => button = Some(MouseButton::Back),
+      "mouseforward" | "mousex2" | "xbutton2" | "browserforward" => {
+        button = Some(MouseButton::Forward);
+      },
+      _ => return Err(format!("unknown token in mouse hotkey: {}", token)),
+    }
+  }
+
+  let button = button.ok_or_else(|| {
+    "mouse hotkey must include a mouse button (MouseLeft/MouseRight/MouseMiddle/MouseBack/MouseForward)"
+      .to_string()
+  })?;
+  Ok(MouseHotkey { ctrl, shift, alt, meta, button })
+}
+
+#[cfg(not(target_os = "windows"))]
+#[derive(Default)]
+struct MouseHotkeyState {
+  was_pressed: bool,
+  modifiers_matched_at_press: bool,
+}
+
+#[cfg(target_os = "windows")]
+type MouseHotkeyMap = HashMap<MouseHotkey, (Function, String)>;
+
+#[cfg(not(target_os = "windows"))]
+type MouseHotkeyMap = HashMap<MouseHotkey, (Function, MouseHotkeyState, String)>;
 
 // We wrap GlobalHotKeyManager so we can send it across threads. This is
 // safe to do for specific windows pointers like HWND since
@@ -249,6 +334,29 @@ fn run() -> Result<(), Box<StdError>> {
 
       let mut hk = hotkeys_clone.lock().unwrap();
       hk.insert(hotkey, callback);
+      Ok(())
+    },
+  )?;
+
+  let mouse_hotkeys: Arc<Mutex<MouseHotkeyMap>> = Arc::new(Mutex::new(HashMap::new()));
+
+  #[cfg(target_os = "windows")]
+  let mouse_hotkey_rx = mouse_hook::init();
+
+  let mouse_hotkeys_clone = mouse_hotkeys.clone();
+  let register_mouse_hotkey = lua.create_function(
+    move |_, (keybind, callback): (String, Function)| -> Result<(), mlua::Error> {
+      let hk = parse_mouse_hotkey(&keybind).map_err(mlua::Error::external)?;
+      let mut hks = mouse_hotkeys_clone.lock().unwrap();
+      #[cfg(target_os = "windows")]
+      {
+        hks.insert(hk, (callback, keybind));
+        mouse_hook::register(hk);
+      }
+      #[cfg(not(target_os = "windows"))]
+      {
+        hks.insert(hk, (callback, MouseHotkeyState::default(), keybind));
+      }
       Ok(())
     },
   )?;
@@ -472,6 +580,7 @@ fn run() -> Result<(), Box<StdError>> {
   globals.set("msgbox", &msgbox)?;
   globals.set("sleep_ms", &sleep_ms)?;
   globals.set("register_hotkey", &register_hotkey)?;
+  globals.set("register_mouse_hotkey", &register_mouse_hotkey)?;
   globals.set("register_hotplug", &register_hotplug)?;
   globals.set("register_screen_edge", &register_screen_edge)?;
   globals.set("main_loop", &main_loop)?;
@@ -497,6 +606,7 @@ fn run() -> Result<(), Box<StdError>> {
   if DO_MAIN_LOOP.load(Ordering::Relaxed) {
     event!(Level::INFO, "starting main loop");
     let hotkeys_clone = hotkeys.clone();
+    let mouse_hotkeys_clone = mouse_hotkeys.clone();
     let hotplug_clone = hotplug.clone();
     let devices_clone = devices.clone();
     let interval_callbacks_clone = interval_callbacks.clone();
@@ -504,6 +614,8 @@ fn run() -> Result<(), Box<StdError>> {
     let rx = hotplug_rx.clone();
     let mut last_screen_edge: Option<&'static str> = None;
     let mut last_edge_check = std::time::Instant::now();
+    #[cfg(not(target_os = "windows"))]
+    let mut last_mouse_hk_check = std::time::Instant::now();
     let mut cached_displays: Vec<DisplayInfo> = DisplayInfo::all().unwrap_or_default();
     let mut last_displays_refresh = std::time::Instant::now();
     event_loop.run(move |_, _, control_flow| {
@@ -533,6 +645,49 @@ fn run() -> Result<(), Box<StdError>> {
             cb.call::<()>((e,)).unwrap();
           }
           last_screen_edge = edge;
+        }
+      }
+
+      #[cfg(target_os = "windows")]
+      while let Ok(hk) = mouse_hotkey_rx.try_recv() {
+        let hks = mouse_hotkeys_clone.lock().unwrap();
+        if let Some((cb, keybind)) = hks.get(&hk)
+          && let Err(e) = cb.call::<()>((keybind.clone(),))
+        {
+          event!(Level::ERROR, error = e.to_string(), "mouse hotkey callback");
+        }
+      }
+
+      #[cfg(not(target_os = "windows"))]
+      if last_mouse_hk_check.elapsed() >= Duration::from_millis(16) {
+        last_mouse_hk_check = std::time::Instant::now();
+        let mut hks = mouse_hotkeys_clone.lock().unwrap();
+        if !hks.is_empty() {
+          let device_state = device_query::DeviceState::new();
+          let mouse = device_state.get_mouse();
+          let keys = device_state.get_keys();
+          let ctrl = keys.contains(&Keycode::LControl) || keys.contains(&Keycode::RControl);
+          let shift = keys.contains(&Keycode::LShift) || keys.contains(&Keycode::RShift);
+          let alt = keys.contains(&Keycode::LAlt) || keys.contains(&Keycode::RAlt);
+          let meta = keys.contains(&Keycode::LMeta) || keys.contains(&Keycode::RMeta);
+
+          for (hk, (cb, state, keybind)) in hks.iter_mut() {
+            let pressed = mouse
+              .button_pressed
+              .get(hk.button.index())
+              .copied()
+              .unwrap_or(false);
+            if pressed && !state.was_pressed {
+              state.modifiers_matched_at_press =
+                ctrl == hk.ctrl && shift == hk.shift && alt == hk.alt && meta == hk.meta;
+            } else if !pressed && state.was_pressed && state.modifiers_matched_at_press {
+              if let Err(e) = cb.call::<()>((keybind.clone(),)) {
+                event!(Level::ERROR, error = e.to_string(), "mouse hotkey callback");
+              }
+              state.modifiers_matched_at_press = false;
+            }
+            state.was_pressed = pressed;
+          }
         }
       }
 

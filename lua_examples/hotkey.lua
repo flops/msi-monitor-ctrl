@@ -11,5 +11,6 @@ local error_handler = function(err)
 end
 
 xpcall(register_hotkey, error_handler, "shift+control+alt+ArrowRight", callback)
+xpcall(register_mouse_hotkey, error_handler, "control+shift+MouseBack", callback)
 
 main_loop()

@@ -34,7 +34,12 @@ display-info = "0.5.9"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 ddc-winapi = { git = "https://github.com/arcnmx/ddc-winapi-rs" }
-windows = { version = "0.61.1", features = ["Win32_System_Console"] }
+windows = { version = "0.61.1", features = [
+  "Win32_System_Console",
+  "Win32_Foundation",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Input_KeyboardAndMouse",
+] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 ddc-macos = "0.2.2"

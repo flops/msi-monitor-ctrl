@@ -14,9 +14,17 @@ _G.host_family = ""
 function sleep_ms(duration) end
 
 ---@param hotkey string
----@param callback function   
+---@param callback function
 ---@return nil
 function register_hotkey(hotkey, callback) end
+
+---@param hotkey string Modifiers + mouse button, e.g. "control+shift+MouseBack".
+---Buttons: MouseLeft, MouseRight, MouseMiddle, MouseBack (XButton1), MouseForward (XButton2).
+---Modifiers: ctrl/control, shift, alt, meta/win. Fires on button release while modifiers
+---were held at press time. Modifier match is exact (extra held modifiers will NOT match).
+---@param callback fun(hotkey: string): nil
+---@return nil
+function register_mouse_hotkey(hotkey, callback) end
 
 ---@param callback function
 ---@return nil
